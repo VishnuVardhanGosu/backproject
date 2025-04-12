@@ -2,50 +2,121 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import sqlite3
 import os
+import boto3
+from boto3.dynamodb.conditions import Key, Attr
+import uuid
+from decimal import Decimal
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# Database setup
-def get_db_connection():
-    conn = sqlite3.connect('banking.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+# DynamoDB setup
+def get_dynamodb_resource():
+    # For production, use AWS credentials properly
+    # For local development, you might use localstack or DynamoDB local
+    return boto3.resource('dynamodb',
+                         aws_access_key_id='',
+                         aws_secret_access_key='',
+                         region_name='ap-south-1',)
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    dynamodb = get_dynamodb_resource()
     
-    # Create Users table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        balance REAL NOT NULL
-    )
-    ''')
+    # Check if Users table exists, if not create it
+    existing_tables = [table.name for table in dynamodb.tables.all()]
     
-    # Create Transactions table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        amount REAL NOT NULL,
-        timestamp DATETIME NOT NULL,
-        note TEXT,
-        recipient_id INTEGER,
-        FOREIGN KEY (user_id) REFERENCES users (id),
-        FOREIGN KEY (recipient_id) REFERENCES users (id)
-    )
-    ''')
+    if 'Users' not in existing_tables:
+        users_table = dynamodb.create_table(
+            TableName='Users',
+            KeySchema=[
+                {
+                    'AttributeName': 'id',
+                    'KeyType': 'HASH'  # Partition key
+                }
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': 'id',
+                    'AttributeType': 'S'
+                },
+                {
+                    'AttributeName': 'email',
+                    'AttributeType': 'S'
+                }
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    'IndexName': 'EmailIndex',
+                    'KeySchema': [
+                        {
+                            'AttributeName': 'email',
+                            'KeyType': 'HASH'
+                        }
+                    ],
+                    'Projection': {
+                        'ProjectionType': 'ALL'
+                    },
+                    'ProvisionedThroughput': {
+                        'ReadCapacityUnits': 5,
+                        'WriteCapacityUnits': 5
+                    }
+                }
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': 5,
+                'WriteCapacityUnits': 5
+            }
+        )
+        
+        # Wait for the table to be created
+        users_table.meta.client.get_waiter('table_exists').wait(TableName='Users')
     
-    conn.commit()
-    conn.close()
+    if 'Transactions' not in existing_tables:
+        transactions_table = dynamodb.create_table(
+            TableName='Transactions',
+            KeySchema=[
+                {
+                    'AttributeName': 'id',
+                    'KeyType': 'HASH'  # Partition key
+                }
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': 'id',
+                    'AttributeType': 'S'
+                },
+                {
+                    'AttributeName': 'user_id',
+                    'AttributeType': 'S'
+                }
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    'IndexName': 'UserIdIndex',
+                    'KeySchema': [
+                        {
+                            'AttributeName': 'user_id',
+                            'KeyType': 'HASH'
+                        }
+                    ],
+                    'Projection': {
+                        'ProjectionType': 'ALL'
+                    },
+                    'ProvisionedThroughput': {
+                        'ReadCapacityUnits': 5,
+                        'WriteCapacityUnits': 5
+                    }
+                }
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': 5,
+                'WriteCapacityUnits': 5
+            }
+        )
+        
+        # Wait for the table to be created
+        transactions_table.meta.client.get_waiter('table_exists').wait(TableName='Transactions')
 
 # Initialize database
 init_db()
@@ -55,39 +126,99 @@ def is_logged_in():
     return 'user_id' in session
 
 def get_user(user_id):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-    conn.close()
-    return user
+    dynamodb = get_dynamodb_resource()
+    users_table = dynamodb.Table('Users')
+    
+    response = users_table.get_item(
+        Key={
+            'id': user_id
+        }
+    )
+    
+    if 'Item' in response:
+        return response['Item']
+    return None
 
 def get_user_by_email(email):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
-    conn.close()
-    return user
+    dynamodb = get_dynamodb_resource()
+    users_table = dynamodb.Table('Users')
+    
+    response = users_table.query(
+        IndexName='EmailIndex',
+        KeyConditionExpression=Key('email').eq(email)
+    )
+    
+    if response['Items'] and len(response['Items']) > 0:
+        return response['Items'][0]
+    return None
 
 def add_transaction(user_id, type, amount, note=None, recipient_id=None):
-    conn = get_db_connection()
-    conn.execute(
-        'INSERT INTO transactions (user_id, type, amount, timestamp, note, recipient_id) VALUES (?, ?, ?, ?, ?, ?)',
-        (user_id, type, amount, datetime.now(), note, recipient_id)
+    dynamodb = get_dynamodb_resource()
+    transactions_table = dynamodb.Table('Transactions')
+    
+    transaction_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
+    
+    transaction_item = {
+        'id': transaction_id,
+        'user_id': user_id,
+        'type': type,
+        'amount': Decimal(str(amount)),  # Convert float to Decimal for DynamoDB
+        'timestamp': timestamp,
+    }
+    
+    if note:
+        transaction_item['note'] = note
+        
+    if recipient_id:
+        transaction_item['recipient_id'] = recipient_id
+    
+    transactions_table.put_item(
+        Item=transaction_item
     )
-    conn.commit()
-    conn.close()
 
 def update_balance(user_id, amount):
-    conn = get_db_connection()
-    conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', (amount, user_id))
-    conn.commit()
-    conn.close()
+    dynamodb = get_dynamodb_resource()
+    users_table = dynamodb.Table('Users')
+    
+    # DynamoDB doesn't support direct increment/decrement like SQL
+    # We need to get the current balance first
+    user = get_user(user_id)
+    new_balance = Decimal(str(user['balance'])) + Decimal(str(amount))
+    
+    users_table.update_item(
+        Key={
+            'id': user_id
+        },
+        UpdateExpression='SET balance = :balance',
+        ExpressionAttributeValues={
+            ':balance': new_balance
+        }
+    )
 
 def get_transactions(user_id):
-    conn = get_db_connection()
-    transactions = conn.execute(
-        'SELECT t.*, u.name as recipient_name FROM transactions t LEFT JOIN users u ON t.recipient_id = u.id WHERE t.user_id = ? ORDER BY t.timestamp DESC',
-        (user_id,)
-    ).fetchall()
-    conn.close()
+    dynamodb = get_dynamodb_resource()
+    transactions_table = dynamodb.Table('Transactions')
+    users_table = dynamodb.Table('Users')
+    
+    # Query transactions for the user
+    response = transactions_table.query(
+        IndexName='UserIdIndex',
+        KeyConditionExpression=Key('user_id').eq(user_id)
+    )
+    
+    transactions = sorted(response['Items'], key=lambda x: x['timestamp'], reverse=True)
+    
+    # Add recipient names to transactions
+    for transaction in transactions:
+        if 'recipient_id' in transaction:
+            recipient = get_user(transaction['recipient_id'])
+            if recipient:
+                transaction['recipient_name'] = recipient['name']
+        
+        # Convert Decimal to float for template rendering
+        transaction['amount'] = float(transaction['amount'])
+    
     return transactions
 
 # Routes
@@ -114,16 +245,20 @@ def register():
         
         # Create new user
         password_hash = generate_password_hash(password)
+        user_id = str(uuid.uuid4())
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO users (name, email, password_hash, balance) VALUES (?, ?, ?, ?)',
-            (name, email, password_hash, initial_deposit)
+        dynamodb = get_dynamodb_resource()
+        users_table = dynamodb.Table('Users')
+        
+        users_table.put_item(
+            Item={
+                'id': user_id,
+                'name': name,
+                'email': email,
+                'password_hash': password_hash,
+                'balance': Decimal(str(initial_deposit))
+            }
         )
-        user_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
         
         # Add initial deposit transaction
         if initial_deposit > 0:
@@ -164,6 +299,9 @@ def dashboard():
         return redirect(url_for('login'))
     
     user = get_user(session['user_id'])
+    # Convert Decimal to float for template rendering
+    user['balance'] = float(user['balance'])
+    
     return render_template('dashboard.html', user=user, logged_in=True)
 
 @app.route('/deposit', methods=['GET', 'POST'])
@@ -206,7 +344,7 @@ def withdraw():
         user_id = session['user_id']
         user = get_user(user_id)
         
-        if user['balance'] < amount:
+        if Decimal(str(user['balance'])) < Decimal(str(amount)):
             flash('Insufficient funds!', 'danger')
             return redirect(url_for('withdraw'))
         
@@ -227,7 +365,8 @@ def transfer():
     if request.method == 'POST':
         recipient_email = request.form['recipient_email']
         amount = float(request.form['amount'])
-        note = request.form.get('phone no', '')
+        mobile_number = request.form.get('mobile_number', '')
+        note = request.form.get('note', '')
         
         if amount <= 0:
             flash('Transfer amount must be positive!', 'danger')
@@ -236,7 +375,7 @@ def transfer():
         user_id = session['user_id']
         user = get_user(user_id)
         
-        if user['balance'] < amount:
+        if Decimal(str(user['balance'])) < Decimal(str(amount)):
             flash('Insufficient funds!', 'danger')
             return redirect(url_for('transfer'))
         
@@ -253,9 +392,14 @@ def transfer():
         update_balance(user_id, -amount)
         update_balance(recipient['id'], amount)
         
+        # Create transfer note with mobile number if provided
+        transfer_note = note
+        if mobile_number:
+            transfer_note = f"Mobile: {mobile_number}" + (f" - {note}" if note else "")
+        
         # Add transactions for both users
-        add_transaction(user_id, 'transfer_sent', amount, note, recipient['id'])
-        add_transaction(recipient['id'], 'transfer_received', amount, f"From {user['name']}: {note}", user_id)
+        add_transaction(user_id, 'transfer_sent', amount, transfer_note, recipient['id'])
+        add_transaction(recipient['id'], 'transfer_received', amount, f"From {user['name']}: {transfer_note}", user_id)
         
         flash('Transfer successful!', 'success')
         return redirect(url_for('dashboard'))
@@ -281,6 +425,8 @@ def profile():
     
     user_id = session['user_id']
     user = get_user(user_id)
+    # Convert Decimal to float for template rendering
+    user['balance'] = float(user['balance'])
     
     if request.method == 'POST':
         action = request.form.get('action')
@@ -300,23 +446,29 @@ def profile():
                 flash('Email already in use!', 'danger')
                 return redirect(url_for('profile'))
             
-            conn = get_db_connection()
+            dynamodb = get_dynamodb_resource()
+            users_table = dynamodb.Table('Users')
+            
+            update_expression = 'SET email = :email'
+            expression_attribute_values = {
+                ':email': email
+            }
+            
             if new_password:
                 password_hash = generate_password_hash(new_password)
-                conn.execute(
-                    'UPDATE users SET email = ?, password_hash = ? WHERE id = ?',
-                    (email, password_hash, user_id)
-                )
+                update_expression += ', password_hash = :password_hash'
+                expression_attribute_values[':password_hash'] = password_hash
                 flash('Profile and password updated successfully!', 'success')
             else:
-                conn.execute(
-                    'UPDATE users SET email = ? WHERE id = ?',
-                    (email, user_id)
-                )
                 flash('Profile updated successfully!', 'success')
             
-            conn.commit()
-            conn.close()
+            users_table.update_item(
+                Key={
+                    'id': user_id
+                },
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_attribute_values
+            )
             
         elif action == 'delete':
             password = request.form['delete_password']
@@ -326,12 +478,32 @@ def profile():
                 flash('Password is incorrect!', 'danger')
                 return redirect(url_for('profile'))
             
-            # Delete account
-            conn = get_db_connection()
-            conn.execute('DELETE FROM transactions WHERE user_id = ?', (user_id,))
-            conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
-            conn.commit()
-            conn.close()
+            # Delete account and transactions
+            dynamodb = get_dynamodb_resource()
+            users_table = dynamodb.Table('Users')
+            transactions_table = dynamodb.Table('Transactions')
+            
+            # Get all user transactions
+            response = transactions_table.query(
+                IndexName='UserIdIndex',
+                KeyConditionExpression=Key('user_id').eq(user_id)
+            )
+            
+            # Delete each transaction
+            with transactions_table.batch_writer() as batch:
+                for transaction in response['Items']:
+                    batch.delete_item(
+                        Key={
+                            'id': transaction['id']
+                        }
+                    )
+            
+            # Delete user
+            users_table.delete_item(
+                Key={
+                    'id': user_id
+                }
+            )
             
             session.pop('user_id', None)
             flash('Your account has been deleted.', 'success')
