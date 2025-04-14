@@ -9,16 +9,14 @@ import uuid
 from decimal import Decimal
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+# Use a persistent secret key - consider loading from environment variable in production
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24))
 
 # DynamoDB setup
 def get_dynamodb_resource():
-    # For production, use AWS credentials properly
-    # For local development, you might use localstack or DynamoDB local
-    return boto3.resource('dynamodb',
-                         aws_access_key_id='',
-                         aws_secret_access_key='',
-                         region_name='ap-south-1',)
+    # Use IAM role attached to EC2 instance
+    # The EC2 instance will automatically use the attached role
+    return boto3.resource('dynamodb', region_name='ap-south-1')
 
 def init_db():
     dynamodb = get_dynamodb_resource()
@@ -514,4 +512,5 @@ def profile():
     return render_template('profile.html', user=user, logged_in=True)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # For production, set debug to False
+    app.run(host='0.0.0.0', port=5000, debug=False)
